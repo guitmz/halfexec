@@ -115,14 +115,13 @@ include "runtime/validate.inc"
 ;     payloads
 ;   * do not write the final stack contents yet because it may still need to
 ;     patch auxv values based on interpreter/TLS scenarios
-; STACK_SIZE is the whole reservation below. Only a slice of it,
-; STACK_STORAGE_SIZE, is actually handed out for copied argv/envp/auxv
-; strings and blobs later in stack.inc, the rest is headroom for the pointer
-; tables themselves plus normal stack growth once the target is running.
+; STACK_SIZE is the whole reservation below. At most STACK_ARGS_LIMIT of it
+; holds copied argv/envp strings and pointer tables (see stack.inc), the rest
+; is normal stack growth once the target is running.
 allocateStack:
     xor rdi, rdi
     mov rsi, STACK_SIZE                                          ; sized well beyond what argv/envp/auxv plus their copied strings should ever need
-    mov rdx, PROT_READ or PROT_WRITE
+    movzx edx, byte [stackProt]                                  ; ET_EXEC honors PT_GNU_STACK here, ET_DYN mprotects again in processPhdrs
     mov r10, MAP_PRIVATE or MAP_ANON
     mov r8, -1
     xor r9, r9
@@ -163,7 +162,7 @@ processPhdrs:
         ; staged in memory. That is what "Delay close()" earlier bought us.
         mov rdi, [targetFd]
         lea rsi, [phdr]
-        mov dx, word [ehdr.phentsize]                            ; already validated equal to sizeof.PHDR earlier, so this always fills the struct fully
+        movzx edx, word [ehdr.phentsize]                         ; already validated equal to sizeof.PHDR earlier, so this always fills the struct fully
         mov r10, r9                                              ; r10 is pread64 file offset argument, avoids a separate seek to walk the table
         mov rax, SYS_PREAD64
         syscall
@@ -175,9 +174,7 @@ processPhdrs:
         ; became common. We honor it so a target that needs an executable
         ; stack still gets one on our synthetic replacement.
         cmp dword [phdr.type], PT_GNU_STACK
-        je .stack
         jne .notStack
-        .stack:
             mov r8d, [phdr.flags]                                ; p_flags carries PF_X here, the only bit PT_GNU_STACK actually uses
             ELF_FLAGS_TO_PROT r8d, edx                           ; PF_* and PROT_* bit numbering do not line up, see the macro
             .stackProtect:
@@ -193,16 +190,9 @@ processPhdrs:
             jne .notInterp
             ; PT_INTERP must stay within the file and end in a trailing NUL
             ; byte because the later open() path uses it as a path name
-            mov rax, [phdr.offset]                               ; p_offset: where the interpreter path bytes begin in the file
-            cmp rax, [fstat.st_size]
-            ja invalidInterpPath
-            mov rdx, [phdr.filesz]
-            test rdx, rdx
-            jz invalidInterpPath
-            mov rcx, [fstat.st_size]
-            sub rcx, rax
-            cmp rdx, rcx
-            ja invalidInterpPath
+            cmp qword [phdr.filesz], 0
+            je invalidInterpPath
+            CHECK_FILE_RANGE [phdr.offset], [phdr.filesz], [fstat.st_size], invalidInterpPath
             mov byte [hasInterp], 1
             lea rax, [buffer]
             add rax, [phdr.offset]                                ; rax now points at the interpreter path bytes inside our staged copy of the file
@@ -241,22 +231,12 @@ processPhdrs:
             mov rax, [phdr.align]                                ; alignment the TCB placement has to respect, easy to get wrong
             mov [tlsAlign], rax
         .notTls:
-            cmp [phdr.type], PT_LOAD                             ; the one type that actually needs a mapping, everything above was just bookkeeping
+            cmp dword [phdr.type], PT_LOAD                       ; the one type that actually needs a mapping, everything above was just bookkeeping
             jne .nextPhdr
             ; All bytes copied from the file must actually exist in the
             ; ELF. The loader allows bss segments (filesz == 0) but not file
             ; ranges that overrun the input buffer
-            mov rax, [phdr.filesz]                               ; first check: filesz can't exceed memsz, the file never supplies more than reserved
-            cmp rax, [phdr.memsz]
-            ja invalidSegment
-            mov rax, [phdr.offset]                               ; second check: even a valid filesz means nothing if the start offset is out of bounds
-            cmp rax, [fstat.st_size]
-            ja invalidSegment
-            mov rdx, [phdr.filesz]                                ; third check: the full byte range has to fit before EOF, not just the start
-            mov rcx, [fstat.st_size]
-            sub rcx, rax
-            cmp rdx, rcx
-            ja invalidSegment
+            CHECK_PT_LOAD [fstat.st_size], invalidSegment
             ; AT_PHDR needs the runtime address of the phdr table itself, not
             ; just where the segments load. If this PT_LOAD's file range
             ; happens to cover ehdr.phoff, that address can be derived right
@@ -468,8 +448,6 @@ forkTransformExec:
     mov [rdi + EXEC_CTX.stack_ptr], rax
     movzx rax, byte [hasInterp]
     mov [rdi + EXEC_CTX.has_interp], rax
-    mov rax, [interpBaseAddr]
-    mov [rdi + EXEC_CTX.interp_base], rax
     mov rax, [interpEhdr.entry]
     add rax, [interpBaseAddr]
     mov [rdi + EXEC_CTX.interp_entry], rax

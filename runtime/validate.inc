@@ -19,6 +19,7 @@
     jne invalidLayout
     cmp word [ehdr.phentsize], sizeof.PHDR                ; every phdr walk below assumes this exact stride, so a mismatch is caught here instead of corrupting the scan
     jne invalidLayout
+    CHECK_PHDR_TABLE ehdr, [fstat.st_size], invalidLayout ; both scans below read phdrs straight out of buffer, so the table must lie inside the file
 
     ; Reset the bits of state that belong to one image so that the later phases
     ; are easier to trust when reading this months (years?) from now
@@ -56,7 +57,7 @@ execPrepare:
     mov byte [hasTls], 0
     mov byte [stackProt], PROT_READ or PROT_WRITE        ; default permissions unless a PT_GNU_STACK phdr overrides them below
     lea rbx, [buffer]
-    add rbx, [ehdr.phoff]                               ; rbx now walks the on disk phdr table directly, no separate bounds check since ehdr.phoff came from the file already fstat'd
+    add rbx, [ehdr.phoff]                               ; rbx now walks the on disk phdr table directly, bounds checked by CHECK_PHDR_TABLE above
     xor ecx, ecx
     movzx ecx, word [ehdr.phnum]
     .scanExecLoop:
@@ -83,25 +84,18 @@ execPrepare:
         ; actually terminated
         cmp dword [phdr.type], PT_INTERP
         jne .execNotInterp
-        mov rax, [phdr.offset]
-        cmp rax, [fstat.st_size]
-        ja invalidInterpPath                        ; an offset past EOF would mean reading garbage or faulting outright
-        mov rdx, [phdr.filesz]
-        test rdx, rdx
-        jz invalidInterpPath                        ; an empty interpreter path is not valid PT_INTERP data
-        mov rcx, [fstat.st_size]
-        sub rcx, rax
-        cmp rdx, rcx                                 ; checks the path string doesn't claim to run past EOF either
-        ja invalidInterpPath
+        cmp qword [phdr.filesz], 0
+        je invalidInterpPath                        ; an empty interpreter path is not valid PT_INTERP data
+        CHECK_FILE_RANGE [phdr.offset], [phdr.filesz], [fstat.st_size], invalidInterpPath
         mov byte [hasInterp], 1
         lea rsi, [dbgInterpFoundMsg]
         mov rdx, dbgInterpFoundMsgLen
         call debugWrite
         lea rax, [buffer]
         add rax, [phdr.offset]                         ; rax now points at the interpreter path string inside the staged file buffer
-        mov rcx, [phdr.filesz]
-        dec rcx                                     ; phdr.filesz includes the NUL, so the last byte to check sits at filesz - 1
-        cmp byte [rax + rcx], 0
+        mov rdx, [phdr.filesz]                         ; rdx and not rcx, since rcx is this loop's phdr counter
+        dec rdx                                     ; phdr.filesz includes the NUL, so the last byte to check sits at filesz - 1
+        cmp byte [rax + rdx], 0
         jne invalidInterpPath
         mov [interpPathPtr], rax
         .execNotInterp:
@@ -125,6 +119,7 @@ execPrepare:
         ; craft a AT_PHDR value
         cmp dword [phdr.type], PT_LOAD
         jne .execNotPhdrHost
+        CHECK_PT_LOAD [fstat.st_size], invalidSegment ; the trampoline later copies these bytes without checking
         mov rax, [ehdr.phoff]
         cmp rax, [phdr.offset]
         jb .execNotPhdrHost                        ; phdr table must start at or after this segment's own file offset to be considered contained in it
@@ -143,6 +138,18 @@ execPrepare:
         dec rcx
         jmp .scanExecLoop
     .scanExecDone:
+    ; The trampoline walks the section headers for IRELATIVE fixups, so that
+    ; table must lie inside the file too (shnum 0 means stripped, nothing to walk)
+    movzx eax, word [ehdr.shnum]
+    test eax, eax
+    jz allocateStack
+    cmp word [ehdr.shentsize], sizeof.SHDR
+    jne invalidLayout
+    imul rax, rax, sizeof.SHDR
+    add rax, [ehdr.shoff]
+    jc invalidLayout
+    cmp rax, [fstat.st_size]
+    ja invalidLayout
     jmp allocateStack
 
 ; ET_DYN pre scan.
