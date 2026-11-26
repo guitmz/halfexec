@@ -178,28 +178,24 @@ prepareStackImage:
         dec rdx
         jmp .countEnvStringsLoop
     .countStringsDone:
-    mov [totalStringBytes], rcx
-    cmp rcx, STACK_STRING_SIZE
-    jg stackStorageTooSmall
-    mov rax, [stackAddr]
-    add rax, STACK_STORAGE_SIZE                                 ; strings live in their own fixed region right after the pointer table area
+    ; Budget covers the strings plus their pointer slots, like the kernel's own
+    ; argv/envp limit, and leaves the rest of the mapping for the running stack
+    mov rax, [targetArgc]
+    add rax, [targetEnvc]
+    lea rcx, [rcx + rax * 8]
+    cmp rcx, STACK_ARGS_LIMIT
+    ja stackStorageTooSmall
+    mov rax, [stackAddr]                                        ; strings grow upward from the bottom of the mapping
     mov [stringWritePtr], rax
     mov rax, [stackAddr]
     add rax, STACK_SIZE                                         ; STACK_SIZE is the whole reservation, table build works backward from its top
     and rax, -16                                              ; same 16 byte floor the parity fixup below assumes for the eventual entry rsp
     mov rcx, [targetEnvc]
     add rcx, [targetArgc]                                       ; total pointer table entries feeds the parity check below, argc gets its own slot separately
-    ; The stack is built downward from the top of the mapping. The exact top
-    ; alignment differs a little between direct entry and PT_INTERP paths, so
-    ; we settle that before laying out the tables
-    ; keeps entry rsp aligned to 16 bytes, interp flips which parity needs the extra word
-    cmp byte [hasInterp], 0
-    jne .stackTopInterp
-    test rcx, 1
-    jz .stackTopReady
-    sub rax, 8
-    jmp .stackTopReady
-    .stackTopInterp:
+    ; The stack is built downward from the top of the mapping. Below the top sit
+    ; 16*auxc bytes of auxv and 8*(argc+envc+3) bytes for argv, envp, their
+    ; NULLs and argc. The kernel enters every program with rsp 16 byte aligned,
+    ; so an even argc+envc needs one pad word, interpreter or not
     test rcx, 1
     jnz .stackTopReady
     sub rax, 8

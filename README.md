@@ -53,5 +53,5 @@ This builds sample programs into `/tmp` and runs each one through halfexec, chec
 
 * `halfexec.asm` is the main loader
 * `utils.inc` holds syscall numbers, constants and structures
-* `runtime/` holds the loader stages: validation, relocation, interpreter loading, stack setup, the trampoline and data
+* `runtime/` holds the loader stages for validation, relocation, interpreter loading, stack setup, the trampoline and data
 * `tests/` holds the sample programs

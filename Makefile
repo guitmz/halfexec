@@ -18,7 +18,7 @@ ARGV_PIE_C := /tmp/argv_pie_c
 COMMON_CFLAGS := -Wall -Wextra
 NOLIBC_CFLAGS := -nostdlib -fno-stack-protector -Wl,--build-id=none
 
-.PHONY: all clean inspect inspect-all binaries run test
+.PHONY: all clean inspect inspect-all binaries run trace
 
 define run_expect
 	@$(DEBUG_ENV)./$(LOADER) $(1); \
@@ -74,19 +74,13 @@ $(ARGV_EXEC_C): tests/argv_nolib.c
 $(ARGV_PIE_C): tests/argv_nolib.c
 	$(CC) $(NOLIBC_CFLAGS) -static-pie -DEXPECTED_SELF=\"$(ARGV_PIE_C)\" -o $@ $<
 
-binaries: \
-	$(LIBC_EXEC_STATIC) \
-	$(LIBC_EXEC_DYN) \
-	$(LIBC_PIE_DYN) \
-	$(LIBC_PIE_STATIC) \
-	$(NOLIBC_EXEC_C) \
-	$(NOLIBC_PIE_C) \
-	$(NOLIBC_EXEC_ASM) \
-	$(ARGV_EXEC_C) \
-	$(ARGV_PIE_C)
+SAMPLES := $(LIBC_EXEC_STATIC) $(LIBC_EXEC_DYN) $(LIBC_PIE_DYN) $(LIBC_PIE_STATIC) \
+	$(NOLIBC_EXEC_C) $(NOLIBC_PIE_C) $(NOLIBC_EXEC_ASM) $(ARGV_EXEC_C) $(ARGV_PIE_C)
+
+binaries: $(SAMPLES)
 
 inspect: binaries
-	for f in $(LIBC_EXEC_STATIC) $(LIBC_EXEC_DYN) $(LIBC_PIE_DYN) $(LIBC_PIE_STATIC) $(NOLIBC_EXEC_C) $(NOLIBC_PIE_C) $(NOLIBC_EXEC_ASM) $(ARGV_EXEC_C) $(ARGV_PIE_C); do \
+	for f in $(SAMPLES); do \
 		echo "== $$f =="; \
 		file "$$f"; \
 		readelf -h "$$f" | grep "Type:"; \
@@ -97,7 +91,7 @@ inspect: binaries
 # A "richer" inspection target is handy when comparing the exact ELF shape that
 # triggered a loader issue
 inspect-all: binaries
-	for f in $(LIBC_EXEC_STATIC) $(LIBC_EXEC_DYN) $(LIBC_PIE_DYN) $(LIBC_PIE_STATIC) $(NOLIBC_EXEC_C) $(NOLIBC_PIE_C) $(NOLIBC_EXEC_ASM) $(ARGV_EXEC_C) $(ARGV_PIE_C); do \
+	for f in $(SAMPLES); do \
 		echo "== $$f =="; \
 		file "$$f"; \
 		readelf -h "$$f"; \
@@ -121,27 +115,9 @@ run: $(LOADER) binaries
 	$(call run_expect,/usr/bin/busybox echo hi,0)
 	$(call run_expect,/usr/bin/busybox ls /tmp,0)
 
-test: $(LOADER)
+# Not a test, it shows the loader's syscalls while it runs /bin/true
+trace: $(LOADER)
 	strace ./$(LOADER) /bin/true
 
 clean:
-	rm -f $(LOADER) \
-		$(LIBC_EXEC_STATIC) \
-		$(LIBC_EXEC_DYN) \
-		$(LIBC_PIE_DYN) \
-		$(LIBC_PIE_STATIC) \
-		$(NOLIBC_EXEC_C) \
-		$(NOLIBC_PIE_C) \
-		$(NOLIBC_EXEC_ASM) \
-		$(ARGV_EXEC_C) \
-		$(ARGV_PIE_C) \
-		exec_libc \
-		pie_libc \
-		exec_static_libc \
-		pie_static_libc \
-		dyn_libc \
-		exec_static \
-		pie_static \
-		nolibc \
-		bla \
-		core
+	rm -f $(LOADER) $(SAMPLES)

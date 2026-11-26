@@ -49,6 +49,7 @@ loadInterp:
     jne invalidLayout
     cmp word [interpEhdr.phentsize], sizeof.PHDR              ; a mismatch here would mean our PHDR struct layout doesn't match what's on disk
     jne invalidLayout
+    CHECK_PHDR_TABLE interpEhdr, [interpStat.st_size], invalidLayout ; both passes below read phdrs straight out of interpBuffer
 
     mov rdi, [interpFd]
     lea rsi, [interpBuffer]                                 ; staged in a flat buffer rather than mmap'd from the file, keeps the phdr math below independent of the final placement
@@ -137,6 +138,7 @@ loadInterp:
         jne .mapInterpNext
         cmp qword [phdr.memsz], 0                           ; same zero sized segment skip as the scan pass above
         je .mapInterpNext
+        CHECK_PT_LOAD [interpStat.st_size], invalidSegment  ; the copy below trusts offset/filesz, so they must stay inside interpBuffer
         mov r12, rcx                                        ; syscall clobbers rcx (and r11), so the phdr counter has to live somewhere else for the calls below
         mov r15, [phdr.vaddr]
         and r15, -PAGE_SIZE

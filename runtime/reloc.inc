@@ -51,8 +51,6 @@ interp:
         mov [pltrelType], rdx                               ; says whether JMPREL entries are RELA or REL shaped, only RELA is supported here
         jmp .nextDynamic
         .notDtPltRel:
-        cmp rax, DT_RELACOUNT                               ; tells you how many leading RELA entries are RELATIVE, unused since every entry gets scanned anyway
-        jne .nextDynamic
         .nextDynamic:
         add rsi, sizeof.DYN
         dec rcx
@@ -65,152 +63,75 @@ interp:
     cmp qword [relaEnt], sizeof.RELA                        ; mismatched entry size means a relocation layout this loader doesn't understand
     jne unsupportedReloc
     cmp qword [pltrelType], 0                               ; zero means there's no JMPREL table at all, go straight to the RELA only path
-    je .applyRelaRelative
+    je .applyRelocs
     cmp qword [pltrelType], DT_RELA                         ; DT_REL (no addend field) would need a different loop entirely, not supported
     jne unsupportedReloc
 
-    ; Pass 1: plain RELATIVE relocations.
-    ; write (base + addend) into (base + offset) and contune. Do this first so
-    ; later we proces against a simpler image
-    .applyRelaRelative:
-    mov rsi, [baseAddr]
-    add rsi, [relaAddr]                                     ; relaAddr is a vaddr from DT_RELA, needs the same base offset as any other pointer into the image
-    mov rcx, [relaSize]                                     ; the RELA table's byte length, as read from DT_RELASZ above
-    xor rdx, rdx
-    mov rax, [relaEnt]
-    test rax, rax                                           ; guards the div below, a zero relaEnt would fault instead of failing cleanly
-    jz unsupportedReloc
-    div rax                                                 ; turns the byte size into an entry count
-    mov rcx, rax
-    .relaRelativeLoop:
-        test rcx, rcx
-        jz .applyJmpRelRelative
-        mov rax, [rsi + RELA.info]
-        and eax, 0xffffffff                                ; low bits hold the relocation type
-        cmp eax, R_X86_64_RELATIVE                          ; other relocation types aren't rejected until pass 2, this pass only ever touches RELATIVE ones
-        jne .nextRelaRelative
-        mov rdi, [baseAddr]
-        add rdi, [rsi + RELA.offset]                        ; offset is the address, relative to the image, of the pointer slot being fixed up
-        mov rax, [baseAddr]
-        add rax, [rsi + RELA.addend]                        ; addend is the value the linker recorded, itself relative to the image's own base
-        mov [rdi], rax
-        .nextRelaRelative:
-        add rsi, sizeof.RELA
-        dec rcx
-        jmp .relaRelativeLoop
+    .applyRelocs:
+    ; Pass 1 writes every RELATIVE slot in both tables. Pass 2 runs the IRELATIVE
+    ; resolvers, so they already see fixed up pointers inside the image
+    mov r8d, R_X86_64_RELATIVE
+    call applyRelaTables
+    mov r8d, R_X86_64_IRELATIVE
+    call applyRelaTables
+    jmp prepareTlsAndStack
 
-    .applyJmpRelRelative:
-    ; Some static PIEs also sneak RELATIVE relocations into JMPREL
-    cmp qword [jmprelSize], 0
-    je .applyRelaIRelative
-    mov rsi, [baseAddr]
-    add rsi, [jmprelAddr]                                   ; same walk as the RELA pass above, just over the PLT relocation table
-    mov rcx, [jmprelSize]                                   ; JMPREL table's byte length, from DT_PLTRELSZ above
-    xor rdx, rdx
-    mov rax, [relaEnt]
-    test rax, rax
-    jz unsupportedReloc                                     ; same div by zero guard as the RELA pass
-    div rax
-    mov rcx, rax
-    .jmprelRelativeLoop:
-        test rcx, rcx
-        jz .applyRelaIRelative
-        mov rax, [rsi + RELA.info]
-        and eax, 0xffffffff                                 ; same relocation type mask as above
-        cmp eax, R_X86_64_RELATIVE                          ; same selective pass, unsupported types get caught later against IRELATIVE
-        jne .nextJmpRelRelative
-        mov rdi, [baseAddr]
-        add rdi, [rsi + RELA.offset]
-        mov rax, [baseAddr]
-        add rax, [rsi + RELA.addend]
-        mov [rdi], rax
-        .nextJmpRelRelative:
-        add rsi, sizeof.RELA
-        dec rcx
-        jmp .jmprelRelativeLoop
-
-    .applyRelaIRelative:
-    ; Pass 2: IRELATIVE relocations.
-    ; These call back into resolver code inside the image, after the plain
-    ; RELATIVE pointers are already fixed
-    mov rsi, [baseAddr]
-    add rsi, [relaAddr]                                     ; identical entry count math as pass 1, now scanning for IRELATIVE instead of RELATIVE
+; Run one pass over both RELA and JMPREL.
+; Input is r8d, the relocation type this pass applies
+applyRelaTables:
+    mov rsi, [relaAddr]
     mov rcx, [relaSize]
-    xor rdx, rdx
-    mov rax, [relaEnt]
-    test rax, rax
-    jz unsupportedReloc
-    div rax                                                 ; same byte size to entry count conversion as pass 1
-    mov rcx, rax
-    .relaIRelativeLoop:
-        test rcx, rcx
-        jz .applyJmpRelIRelative
-        mov rax, [rsi + RELA.info]
-        and eax, 0xffffffff                                 ; low bits hold the relocation type, same mask as pass 1
-        cmp eax, R_X86_64_IRELATIVE
-        jne .checkUnsupportedRela                           ; anything that isn't RELATIVE or IRELATIVE finally gets rejected here
-        mov rdi, [baseAddr]
-        add rdi, [rsi + RELA.offset]                        ; still the slot being fixed up, but the value that lands here comes from calling code below
-        mov rax, [baseAddr]
-        add rax, [rsi + RELA.addend]                        ; for IRELATIVE, addend is the resolver function's address, not the final value
-        push rcx                                            ; loop state has to survive the call, the resolver is arbitrary code and its calling convention isn't ours to assume
-        push rsi
-        push rdi
-        call rax                                            ; jumps into the image's own ifunc resolver to get the real pointer value
-        pop rdi
-        pop rsi
-        pop rcx
-        mov [rdi], rax                                      ; rax on return is the resolved pointer, that's what actually goes into the relocation slot
-        jmp .nextRelaIRelative
-        .checkUnsupportedRela:
-        cmp eax, R_X86_64_RELATIVE                          ; RELATIVE entries were already handled in pass 1, seeing one again here is fine
-        je .nextRelaIRelative
-        jmp unsupportedReloc
-        .nextRelaIRelative:
-        add rsi, sizeof.RELA
-        dec rcx
-        jmp .relaIRelativeLoop
+    call applyRelaTable
+    mov rsi, [jmprelAddr]
+    mov rcx, [jmprelSize]                                   ; some static PIEs also sneak RELATIVE/IRELATIVE entries into JMPREL
+    call applyRelaTable
+    ret
 
-    .applyJmpRelIRelative:
-    ; Same idea again for the PLT relocation table, because some binaries stash
-    ; IRELATIVE entries there instead of in the main RELA table (if I understood
-    ; correctly, but seems to work?)
-    cmp qword [jmprelSize], 0
-    je prepareTlsAndStack
-    mov rsi, [baseAddr]
-    add rsi, [jmprelAddr]                                   ; same JMPREL walk as the RELATIVE pass above, this time hunting IRELATIVE entries
-    mov rcx, [jmprelSize]
-    xor rdx, rdx
-    mov rax, [relaEnt]
-    test rax, rax
-    jz unsupportedReloc                                     ; same guard against a zero relaEnt as the earlier passes
-    div rax                                                 ; same conversion once more, over the PLT table
+; Apply every entry of type r8d in one table. Any type other than RELATIVE or
+; IRELATIVE is rejected, this loader does not resolve symbols.
+; Inputs are rsi with the link time table vaddr, rcx with the table byte size
+; and r8d with the type
+applyRelaTable:
+    test rcx, rcx
+    jz .done
+    add rsi, [baseAddr]                                     ; table vaddr needs the load bias like any other pointer into the image
+    mov rax, rcx
+    xor edx, edx
+    div qword [relaEnt]                                     ; byte size / entry size = entry count (relaEnt was checked non zero above)
     mov rcx, rax
-    .jmprelIRelativeLoop:
+    .loop:
         test rcx, rcx
-        jz prepareTlsAndStack                               ; ran out of JMPREL entries, both relocation passes are done, safe to continue booting the target
-        mov rax, [rsi + RELA.info]
-        and eax, 0xffffffff                                 ; relocation type mask, same as the other three passes
+        jz .done
+        mov eax, dword [rsi + RELA.info]                    ; low 32 bits hold the relocation type
+        cmp eax, R_X86_64_RELATIVE
+        je .known
         cmp eax, R_X86_64_IRELATIVE
-        jne .checkUnsupportedJmpRel
+        jne unsupportedReloc
+        .known:
+        cmp eax, r8d
+        jne .next
         mov rdi, [baseAddr]
-        add rdi, [rsi + RELA.offset]                        ; same slot-plus-call situation as the RELA IRELATIVE pass above
+        add rdi, [rsi + RELA.offset]                        ; the slot being fixed up
         mov rax, [baseAddr]
-        add rax, [rsi + RELA.addend]                        ; addend here is again a resolver address, not a plain pointer value
+        add rax, [rsi + RELA.addend]                        ; the final value for RELATIVE, the resolver address for IRELATIVE
+        cmp r8d, R_X86_64_IRELATIVE
+        jne .store
+        ; Two calls deep plus these four pushes keeps rsp 16 byte aligned
+        ; before the call, so the resolver gets the ABI entry alignment
         push rcx
         push rsi
         push rdi
-        call rax                                            ; PLT variant of the same ifunc resolver call
+        push r8
+        call rax                                            ; image's own ifunc resolver returns the real pointer
+        pop r8
         pop rdi
         pop rsi
         pop rcx
-        mov [rdi], rax                                      ; store the resolver's actual return value, mirroring the RELA IRELATIVE pass
-        jmp .nextJmpRelIRelative
-        .checkUnsupportedJmpRel:
-        cmp eax, R_X86_64_RELATIVE
-        je .nextJmpRelIRelative
-        jmp unsupportedReloc
-        .nextJmpRelIRelative:
+        .store:
+        mov [rdi], rax
+        .next:
         add rsi, sizeof.RELA
         dec rcx
-        jmp .jmprelIRelativeLoop
+        jmp .loop
+    .done:
+    ret

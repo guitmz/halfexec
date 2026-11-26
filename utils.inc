@@ -5,7 +5,6 @@ SYS_CLOSE       = 0x3
 SYS_PREAD64     = 0x11
 SYS_FSTAT       = 0x5
 SYS_MMAP        = 0x9
-SYS_MUNMAP      = 0xb
 SYS_MPROTECT    = 0xa
 SYS_EXIT        = 0x3c
 SYS_ARCH_PRCTL  = 0x9e
@@ -58,25 +57,22 @@ ARCH_SET_FS     = 0x1002
 ; PT_DYNAMIC tags for the tiny relocation subset this loader handles itself
 DT_NULL         = 0x0
 DT_PLTRELSZ     = 0x2
-DT_PLTGOT       = 0x3
 DT_RELA         = 0x7
 DT_RELASZ       = 0x8
 DT_RELAENT      = 0x9
 DT_PLTREL       = 0x14
 DT_JMPREL       = 0x17
-DT_RELACOUNT    = 0x6ffffff9
 
 R_X86_64_RELATIVE   = 0x8
 R_X86_64_IRELATIVE  = 0x25
 SHT_RELA            = 0x4
-; The stack reservation is bigger than the part we use to stash copied
-; argv/envp/auxv payloads. STACK_STORAGE_SIZE marks the owned storage area for
-; duplicated strings and aux blobs
+; Copied argv/envp strings grow up from the bottom of the stack mapping and the
+; pointer tables grow down from its top. STACK_ARGS_LIMIT caps strings plus
+; pointer slots, which leaves at least half the mapping for the running stack
 STACK_SIZE          = 8388608 ; 8*1024*1024
+STACK_ARGS_LIMIT    = STACK_SIZE / 2
 TLS_TCB_SIZE        = 0x1000
 TLS_DTV_SIZE        = 0x30
-STACK_STORAGE_SIZE  = 0x5000
-STACK_STRING_SIZE   = 0x5000
 ; Convert ELF PF_* bits into Linux PROT_* bits.
 ; The numbering does not line up, which is an easy way to ruin a loader on a
 ; sleepy night, so this macro keeps the translation in one place
@@ -116,6 +112,38 @@ macro UPDATE_LOAD_SPAN start_reg, end_reg, min_sym, max_sym
     jbe .done
     mov [max_sym], end_reg
   .done:
+}
+; Jump to fail unless [offset, offset + size) lies inside a file of file_size
+; bytes. Written so that a huge offset or size cannot wrap around. Clobbers rax, rdx
+macro CHECK_FILE_RANGE offset_mem, size_mem, file_size_mem, fail
+{
+    mov rax, offset_mem
+    cmp rax, file_size_mem
+    ja fail
+    mov rdx, file_size_mem
+    sub rdx, rax
+    cmp qword size_mem, rdx
+    ja fail
+}
+; Validate the PT_LOAD currently held in the phdr scratch struct. The file
+; never supplies more than memsz, and the file bytes must exist. Clobbers rax, rdx
+macro CHECK_PT_LOAD file_size_mem, fail
+{
+    mov rax, [phdr.filesz]
+    cmp rax, [phdr.memsz]
+    ja fail
+    CHECK_FILE_RANGE [phdr.offset], [phdr.filesz], file_size_mem, fail
+}
+; The whole phdr table (phnum entries of sizeof.PHDR, phentsize was already
+; checked) must fit inside the staged file. Clobbers rax
+macro CHECK_PHDR_TABLE ehdr_sym, file_size_mem, fail
+{
+    movzx eax, word [ehdr_sym#.phnum]
+    imul rax, rax, sizeof.PHDR
+    add rax, [ehdr_sym#.phoff]
+    jc fail
+    cmp rax, file_size_mem
+    ja fail
 }
 ; Enter a fully prepared image.
 ; By the time this runs, the stack is ready and the entry point is known. We
@@ -229,7 +257,6 @@ struc EXEC_CTX {
     .entry         rq 1
     .stack_ptr     rq 1
     .has_interp    rq 1
-    .interp_base   rq 1
     .interp_entry  rq 1
 }
 virtual at 0

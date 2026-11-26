@@ -50,6 +50,13 @@ static int streq(const char *left, const char *right)
   return *left == *right;
 }
 
+/*
+ * A pointer table needs RELATIVE relocations in the PIE build. Nothing in this
+ * binary relocates itself, so the check below only passes if halfexec applied
+ * every entry, not just the first one
+ */
+static const char *const expected[] = {EXPECTED_SELF, "alpha", "beta"};
+
 static void real_start(long *stack_words)
 {
   /*
@@ -58,6 +65,14 @@ static void real_start(long *stack_words)
    */
   long argc;
   char **argv;
+
+  /* The kernel enters every program with rsp 16 byte aligned */
+  if ((unsigned long)stack_words & 15)
+  {
+    static const char bad_align[] = "stack misaligned\n";
+    sys_write(1, bad_align, sizeof(bad_align) - 1);
+    sys_exit(8);
+  }
 
   argc = stack_words[0];
   argv = (char **)&stack_words[1];
@@ -69,13 +84,14 @@ static void real_start(long *stack_words)
     sys_exit(9);
   }
 
-  if (!streq(argv[0], EXPECTED_SELF) ||
-      !streq(argv[1], "alpha") ||
-      !streq(argv[2], "beta"))
+  for (int i = 0; i < 3; i++)
   {
-    static const char bad_argv[] = "argv mismatch\n";
-    sys_write(1, bad_argv, sizeof(bad_argv) - 1);
-    sys_exit(9);
+    if (!streq(argv[i], expected[i]))
+    {
+      static const char bad_argv[] = "argv mismatch\n";
+      sys_write(1, bad_argv, sizeof(bad_argv) - 1);
+      sys_exit(9);
+    }
   }
 
   static const char ok[] = "argv ok\n";
@@ -89,7 +105,8 @@ static void real_start(long *stack_words)
  */
 __attribute__((naked, noreturn)) void _start(void)
 {
+  /* call and not jmp, so real_start sees the normal function entry alignment */
   asm volatile(
       "mov %rsp, %rdi\n"
-      "jmp real_start\n");
+      "call real_start\n");
 }

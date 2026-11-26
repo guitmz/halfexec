@@ -94,6 +94,10 @@ execTrampolineStart:
     ; Static ET_EXEC only needs the SHDR IRELATIVE cleanup.
     ; The richer relocation story lives in the normal ET_DYN path
     .done:
+    ; A dynamic ET_EXEC gets its IRELATIVE fixups from ld.so once libc is
+    ; loaded. Running its resolvers here, before any PLT is bound, would crash
+    cmp qword [rbx + EXEC_CTX.has_interp], 0
+    jne .jumpEntry
     mov r13, [rbx + EXEC_CTX.shoff]                     ; second walk, this time over section headers rather than program headers
     add r13, r12
     mov r14, [rbx + EXEC_CTX.shentsize]
@@ -106,7 +110,13 @@ execTrampolineStart:
         mov r10, [r13 + SHDR.entsize]
         test r10, r10                                   ; a zero entsize would fault the div below, skip such degenerate sections
         jz .shnext
-        mov r11, [r13 + SHDR.offset]
+        mov r11, [r13 + SHDR.offset]                    ; skip a section whose bytes are not inside the staged file
+        cmp r11, [rbx + EXEC_CTX.file_size]
+        ja .shnext
+        mov rax, [rbx + EXEC_CTX.file_size]
+        sub rax, r11
+        cmp [r13 + SHDR.size], rax
+        ja .shnext
         add r11, r12
         mov rcx, [r13 + SHDR.size]
         xor rdx, rdx
@@ -122,16 +132,17 @@ execTrampolineStart:
             jne .relanext
             mov rdi, [r11 + RELA.offset]                ; the value that lands at this address comes from calling the resolver in rax below, not straight from the table
             mov rax, [r11 + RELA.addend]                ; addend is the ifunc resolver's address for an IRELATIVE entry, not a plain pointer value
-            push rcx                                    ; every bit of surrounding loop state gets saved, the resolver is arbitrary code with no promise about what it preserves
-            push r11
-            push r13
-            push r14
-            push r15
+            ; Save the caller saved registers this loop still needs. rbx and r12 to r15
+            ; are callee saved by the ABI. Four pushes keep rsp 16 byte aligned
+            ; before the call, so the resolver gets the ABI entry alignment
+            push rcx
+            push rdi                                    ; slot address, written after the call
+            push r10                                    ; entsize
+            push r11                                    ; current RELA entry
             call rax                                    ; invokes the image's own resolver to get the real relocated value
-            pop r15
-            pop r14
-            pop r13
             pop r11
+            pop r10
+            pop rdi
             pop rcx
             mov [rdi], rax                              ; rax on return is the resolver's actual result, that's what is stored
             .relanext:

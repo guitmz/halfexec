@@ -25,7 +25,6 @@ argvDst             rq 1
 envpDst             rq 1    
 auxvDst             rq 1    
 stringWritePtr      rq 1    ; upwards growing cursor for copied strings and aux blobs
-totalStringBytes    rq 1    ; total bytes needed for copied argv/env strings
 
 stackAddr       rq 1    ; base address of the custom stack
 baseAddr        rq 1    ; main image load bias (zero for ET_EXEC, non zero for ET_DYN)
